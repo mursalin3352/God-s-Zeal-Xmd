@@ -32,15 +32,23 @@ function extractTextFromMessage(content = {}) {
     );
 }
 
+function getQuotedMessage(m) {
+    // Har type ke message se quoted nikalne ka universal tareeka
+    const msg = m.message || {};
+    const main = msg.ephemeralMessage?.message || msg.viewOnceMessageV2?.message || msg.viewOnceMessage?.message || msg;
+
+    const contextInfo = main.extendedTextMessage?.contextInfo || main.imageMessage?.contextInfo || main.videoMessage?.contextInfo || main.conversation?.contextInfo || main.contextInfo || {};
+    return {
+        quotedMessage: contextInfo.quotedMessage || null,
+        stanzaId: contextInfo.stanzaId,
+        participant: contextInfo.participant,
+        contextInfo
+    };
+}
+
 async function relayGroupStatus(sock, from, payload) {
-    const generatedMessage = generateWAMessageFromContent(
-        from,
-        payload,
-        { userJid: sock.user.id }
-    );
-    await sock.relayMessage(from, generatedMessage.message, {
-        messageId: generatedMessage.key.id
-    });
+    const generatedMessage = generateWAMessageFromContent(from, payload, { userJid: sock.user.id });
+    await sock.relayMessage(from, generatedMessage.message, { messageId: generatedMessage.key.id });
 }
 
 async function gcstatus(sock, chatId, message, inputText) {
@@ -52,96 +60,114 @@ async function gcstatus(sock, chatId, message, inputText) {
         return reply('❌ This command is for groups only.');
     }
 
-    // FIX: quoted ko sahi se pakadna + command text ko clean karna
-    const quotedInfo = m.message?.extendedTextMessage?.contextInfo || m.message?.imageMessage?.contextInfo || m.message?.videoMessage?.contextInfo || {};
-    const quotedMessage = quotedInfo?.quotedMessage || null;
+    const { quotedMessage, stanzaId, participant } = getQuotedMessage(m);
 
+    // Input text ko saaf karo -.gcstatus hatado
     let rawText = Array.isArray(inputText)? inputText.join(' ') : String(inputText || '');
     rawText = rawText.replace(/^\.?gcstatus\s*/i, '').trim();
-    const text = rawText;
 
-    const targetMessage = quotedMessage
-      ? {
-            key: {
-                remoteJid: from,
-                id: quotedInfo.stanzaId,
-                participant: quotedInfo.participant
-            },
+    let targetMessage;
+    let rawContent;
+
+    if (quotedMessage) {
+        rawContent = quotedMessage.ephemeralMessage?.message || quotedMessage.viewOnceMessageV2?.message || quotedMessage.viewOnceMessage?.message || quotedMessage;
+        targetMessage = {
+            key: { remoteJid: from, id: stanzaId, participant: participant },
             message: quotedMessage
+        };
+    } else {
+        rawContent = m.message?.ephemeralMessage?.message || m.message?.viewOnceMessageV2?.message || m.message || {};
+        rawContent = rawContent.extendedTextMessage || rawContent.imageMessage || rawContent.videoMessage || rawContent.conversation? rawContent : rawContent;
+        // Agar direct media caption pe.gcstatus likha hai
+        if (m.message?.imageMessage || m.message?.videoMessage) {
+            rawContent = m.message;
+            targetMessage = m;
+        } else {
+            targetMessage = m;
+            rawContent = m.message || {};
         }
-        : m;
-
-    const rawContent = targetMessage.message || {};
-    const content = rawContent.ephemeralMessage?.message || rawContent.viewOnceMessageV2?.message || rawContent;
-
-    const isImage =!!content.imageMessage;
-    const isVideo =!!content.videoMessage;
-    const isAudio =!!content.audioMessage ||!!content.pttMessage;
-
-    let fallbackText = '';
-    if (isImage) fallbackText = content.imageMessage?.caption || '';
-    else if (isVideo) fallbackText = content.videoMessage?.caption || '';
-    else fallbackText = extractTextFromMessage(content);
-
-    let statusText = text || fallbackText;
-    if (statusText.trim().toLowerCase() === '.gcstatus' || statusText.trim().toLowerCase() === 'gcstatus') {
-        statusText = '';
     }
 
-    if (!isImage &&!isVideo &&!isAudio &&!statusText) {
-        return reply(
-            `*Usage:*\n` +
-            `•.gcstatus Hello group\n` +
-            `•.gcstatus (as caption on media)\n` +
-            `•.gcstatus (reply to image/video/audio)`
-        );
+    const content = rawContent.ephemeralMessage?.message || rawContent.viewOnceMessageV2?.message || rawContent.viewOnceMessage?.message || rawContent;
+
+    const actualContent = content.imageMessage? content : (content.extendedTextMessage? content : content);
+
+    const isImage =!!(actualContent.imageMessage || content.imageMessage);
+    const isVideo =!!(actualContent.videoMessage || content.videoMessage);
+    const isAudio =!!(actualContent.audioMessage || content.audioMessage || actualContent.pttMessage);
+
+    let mediaContent = content.imageMessage? content : actualContent;
+    if (content.imageMessage || content.videoMessage || content.audioMessage) mediaContent = content;
+    else if (actualContent.imageMessage || actualContent.videoMessage) mediaContent = actualContent;
+
+    const finalMediaObj = mediaContent.imageMessage? mediaContent : (mediaContent.imageMessage? mediaContent : mediaContent);
+
+    // Caption / fallback
+    let fallbackText = '';
+    const mediaCheck = finalMediaObj.imageMessage || finalMediaObj.videoMessage? finalMediaObj : content;
+    if (mediaCheck.imageMessage) fallbackText = mediaCheck.imageMessage.caption || '';
+    else if (mediaCheck.videoMessage) fallbackText = mediaCheck.videoMessage.caption || '';
+    else fallbackText = extractTextFromMessage(content);
+
+    let statusText = rawText || fallbackText;
+
+    // Agar abhi bhi.gcstatus hi hai to khali kar do
+    if (statusText.trim().toLowerCase() === '.gcstatus' || statusText.toLowerCase().startsWith('.gcstatus')) {
+        statusText = statusText.replace(/^\.?gcstatus\s*/i, '').trim();
+    }
+
+    const hasMedia = isImage || isVideo || isAudio || (quotedMessage && (quotedMessage.imageMessage || quotedMessage.videoMessage || quotedMessage.audioMessage || quotedMessage.viewOnceMessageV2?.message?.imageMessage));
+
+    if (!hasMedia &&!statusText) {
+        return reply(`*Usage:*\n•.gcstatus Hello group\n•.gcstatus (as caption on media)\n•.gcstatus (reply to image/video/audio)`);
     }
 
     await sock.sendMessage(from, { react: { text: '⏳', key: m.key } });
 
     try {
-        const textParts = splitTextPreservingFormat(statusText, WHATSAPP_STATUS_TEXT_LIMIT);
+        // Agar quoted me media hai to usko use karo
+        let useMedia = hasMedia;
+        let downloadTarget = targetMessage;
+        let finalContent = content;
 
-        if (isImage || isVideo || isAudio) {
-            const mediaBuffer = await downloadMediaMessage(
-                targetMessage,
-                'buffer',
-                {},
-                {
-                    logger: pino({ level: 'silent' }),
-                    reuploadRequest: sock.updateMediaMessage
-                }
-            );
+        if (quotedMessage) {
+            const qInner = quotedMessage.viewOnceMessageV2?.message || quotedMessage.viewOnceMessage?.message || quotedMessage.ephemeralMessage?.message || quotedMessage;
+            if (qInner.imageMessage || qInner.videoMessage || qInner.audioMessage) {
+                finalContent = qInner;
+                useMedia = true;
+            }
+        } else {
+            const mInner = m.message?.viewOnceMessageV2?.message || m.message?.ephemeralMessage?.message || m.message;
+            if (mInner?.imageMessage || mInner?.videoMessage) {
+                finalContent = mInner;
+                useMedia = true;
+            }
+        }
 
+        if (useMedia) {
+            const mediaBuffer = await downloadMediaMessage(downloadTarget, 'buffer', {}, { logger: pino({ level: 'silent' }), reuploadRequest: sock.updateMediaMessage });
+            const textParts = splitTextPreservingFormat(statusText, WHATSAPP_STATUS_TEXT_LIMIT);
             const captions = textParts.length? textParts : [statusText || undefined];
 
             for (const caption of captions) {
                 let mediaOptions = {};
-                if (isImage) mediaOptions = { image: mediaBuffer, caption };
-                if (isVideo) mediaOptions = { video: mediaBuffer, caption };
-                if (isAudio) mediaOptions = { audio: mediaBuffer, mimetype: content.audioMessage?.mimetype || 'audio/mp4' };
+                if (finalContent.imageMessage) mediaOptions = { image: mediaBuffer, caption };
+                else if (finalContent.videoMessage) mediaOptions = { video: mediaBuffer, caption };
+                else mediaOptions = { audio: mediaBuffer, mimetype: finalContent.audioMessage?.mimetype || 'audio/mp4' };
 
-                const preparedMedia = await prepareWAMessageMedia(mediaOptions, {
-                    upload: sock.wsUploadToServer
-                });
-
+                const preparedMedia = await prepareWAMessageMedia(mediaOptions, { upload: sock.wsUploadToServer });
                 let finalMediaMessage = {};
-                if (isImage) finalMediaMessage = { imageMessage: preparedMedia.imageMessage };
-                if (isVideo) finalMediaMessage = { videoMessage: preparedMedia.videoMessage };
-                if (isAudio) finalMediaMessage = { audioMessage: preparedMedia.audioMessage };
+                if (finalContent.imageMessage) finalMediaMessage = { imageMessage: preparedMedia.imageMessage };
+                else if (finalContent.videoMessage) finalMediaMessage = { videoMessage: preparedMedia.videoMessage };
+                else finalMediaMessage = { audioMessage: preparedMedia.audioMessage };
 
-                await relayGroupStatus(sock, from, {
-                    groupStatusMessageV2: {
-                        message: finalMediaMessage
-                    }
-                });
+                await relayGroupStatus(sock, from, { groupStatusMessageV2: { message: finalMediaMessage } });
             }
         } else {
+            const textParts = splitTextPreservingFormat(statusText, WHATSAPP_STATUS_TEXT_LIMIT);
             const parts = textParts.length? textParts : [statusText];
-
             for (const part of parts) {
                 const randomHex = Math.floor(Math.random() * 0xFFFFFF).toString(16).padStart(6, '0');
-
                 await relayGroupStatus(sock, from, {
                     groupStatusMessageV2: {
                         message: {
@@ -155,7 +181,6 @@ async function gcstatus(sock, chatId, message, inputText) {
                 });
             }
         }
-
         await sock.sendMessage(from, { react: { text: '✅', key: m.key } });
     } catch (error) {
         console.error('[GCSTATUS] error:', error);
