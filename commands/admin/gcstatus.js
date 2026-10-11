@@ -1,176 +1,140 @@
-const {
-    downloadMediaMessage,
-    prepareWAMessageMedia,
-    generateWAMessageFromContent
-} = require('@whiskeysockets/baileys');
-const pino = require('pino');
+/**
+ * Group Status Command - CLEAN - No Spam, No Duplicate Pic
+ * Fixed for your requirement
+ */
 
-const WHATSAPP_STATUS_TEXT_LIMIT = 1024;
+const { PassThrough } = require("stream");
+const ffmpeg = require("fluent-ffmpeg");
+const ffmpegStatic = require("ffmpeg-static");
+const { downloadContentFromMessage } = require("@whiskeysockets/baileys");
+const fs = require('fs');
+const path = require('path');
 
-function splitTextPreservingFormat(input, limit = WHATSAPP_STATUS_TEXT_LIMIT) {
-    if (!input) return [];
-    const chunks = [];
-    let remaining = input;
-    while (remaining.length > limit) {
-        let splitAt = remaining.lastIndexOf('\n', limit);
-        if (splitAt <= 0) splitAt = remaining.lastIndexOf(' ', limit);
-        if (splitAt <= 0) splitAt = limit;
-        chunks.push(remaining.slice(0, splitAt));
-        remaining = remaining.slice(splitAt);
+ffmpeg.setFfmpegPath(ffmpegStatic);
+
+const TEMP_DIR = path.join(__dirname, '../../tmp');
+if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR, { recursive: true });
+
+const PURPLE_COLOR = "#9C27B0";
+
+function detectMediaType(message) {
+    if (!message || typeof message!== "object") return null;
+    if (message.imageMessage) return "image";
+    if (message.videoMessage) return "video";
+    if (message.audioMessage) return "audio";
+    if (message.stickerMessage) return "sticker";
+    return null;
+}
+
+function unwrapQuotedMessage(message) {
+    let current = message;
+    for (let i = 0; i < 4; i++) {
+        const wrapper = current?.viewOnceMessageV2 || current?.viewOnceMessage || current?.viewOnceMessageV2Extension || current?.documentWithCaptionMessage;
+        if (!wrapper?.message) break;
+        current = wrapper.message;
     }
-    if (remaining.length) chunks.push(remaining);
-    return chunks;
+    return current;
 }
 
-function extractTextFromMessage(content = {}) {
-    return content.conversation || content.extendedTextMessage?.text || content.imageMessage?.caption || content.videoMessage?.caption || '';
+async function downloadMedia(message, type) {
+    const mediaMessage = message[`${type}Message`];
+    if (!mediaMessage) throw new Error(`Missing ${type} message payload.`);
+    const stream = await downloadContentFromMessage(mediaMessage, type);
+    const chunks = [];
+    for await (const chunk of stream) chunks.push(chunk);
+    return Buffer.concat(chunks);
 }
 
-function getQuotedMessage(m) {
-    const msg = m.message || {};
-    const main = msg.ephemeralMessage?.message || msg.viewOnceMessageV2?.message || msg.viewOnceMessage?.message || msg;
-    const contextInfo = main.extendedTextMessage?.contextInfo || main.imageMessage?.contextInfo || main.videoMessage?.contextInfo || main.contextInfo || {};
-    return { quotedMessage: contextInfo.quotedMessage || null, stanzaId: contextInfo.stanzaId, participant: contextInfo.participant };
+async function postGroupStatus(client, jid, content) {
+    const statusSourceType = content.text? "TEXT" : content.image? "IMAGE" : content.video? "VIDEO" : content.audio? "AUDIO" : content.sticker? "IMAGE" : "TEXT";
+    return client.sendMessage(jid, {
+      ...content,
+        contextInfo: {
+          ...(content.contextInfo || {}),
+            isGroupStatus: true,
+            statusSourceType,
+            statusAttributions: [{ type: 10 }],
+            statusAudienceMetadata: { audienceType: "CLOSE_FRIENDS" }
+        }
+    });
 }
 
-async function relayGroupStatus(sock, from, payload) {
-    const generatedMessage = generateWAMessageFromContent(from, payload, { userJid: sock.user.id });
-    await sock.relayMessage(from, generatedMessage.message, { messageId: generatedMessage.key.id });
+async function convertToVoiceNote(buffer) {
+    return new Promise((resolve, reject) => {
+        const input = new PassThrough();
+        const output = new PassThrough();
+        const chunks = [];
+        input.end(buffer);
+        output.on("data", (chunk) => chunks.push(chunk));
+        ffmpeg(input).noVideo().audioCodec("libopus").format("ogg").audioChannels(1).audioFrequency(48000).on("error", reject).on("end", () => resolve(Buffer.concat(chunks))).pipe(output);
+    });
+}
+
+async function generateWaveform(buffer, bars = 64) {
+    return new Promise((resolve, reject) => {
+        const input = new PassThrough();
+        const chunks = [];
+        input.end(buffer);
+        ffmpeg(input).audioChannels(1).audioFrequency(16000).format("s16le").on("error", reject).on("end", () => {
+                const raw = Buffer.concat(chunks);
+                const samples = Math.floor(raw.length / 2);
+                if (!samples) return resolve(undefined);
+                const amplitudes = [];
+                for (let i = 0; i < samples; i++) { amplitudes.push(Math.abs(raw.readInt16LE(i * 2)) / 32768); }
+                const size = Math.floor(amplitudes.length / bars);
+                if (!size) return resolve(undefined);
+                const averages = Array.from({ length: bars }, (_, index) => {
+                    const slice = amplitudes.slice(index * size, (index + 1) * size);
+                    return slice.reduce((sum, value) => sum + value, 0) / slice.length;
+                });
+                const max = Math.max(...averages);
+                if (!max) return resolve(undefined);
+                resolve(Buffer.from(averages.map((value) => Math.floor((value / max) * 100))).toString("base64"));
+            }).pipe().on("data", (chunk) => chunks.push(chunk));
+    });
 }
 
 async function gcstatus(sock, chatId, message, inputText) {
-    const from = chatId;
-    const m = message;
-    const reply = (text) => sock.sendMessage(from, { text }, { quoted: m });
+    const caption = (Array.isArray(inputText)? inputText.join(' ') : (inputText || '')).trim();
 
-    if (!from.endsWith('@g.us')) {
-        return reply('❌ This command is for groups only.');
-    }
+    if (!chatId.endsWith('@g.us')) return;
 
-    const { quotedMessage, stanzaId, participant } = getQuotedMessage(m);
-    let args = Array.isArray(inputText)? inputText : String(inputText || '').trim().split(/ +/);
-    if (args.length === 1 && args[0] === '') args = [];
+    const quotedMessage = message.message?.extendedTextMessage?.contextInfo?.quotedMessage
+        || message.message?.imageMessage?.contextInfo?.quotedMessage
+        || message.message?.videoMessage?.contextInfo?.quotedMessage;
 
-    //.gcstatus ko args se hatao
-    if (args[0]?.toLowerCase().startsWith('.gcstatus') || args[0]?.toLowerCase().startsWith('gcstatus')) {
-        args.shift();
-    }
-    let rawArgsText = args.join(' ').replace(/^\.?gcstatus\s*/i, '').trim();
-
-    // Target group ka pata lagao (link / jid / current)
-    let targetGroupJid = from;
-    let statusText = rawArgsText;
-    let linkMatch = rawArgsText.match(/https?:\/\/chat\.whatsapp\.com\/([A-Za-z0-9]+)/);
-    let jidMatch = rawArgsText.match(/([0-9]+@g\.us)/);
-
-    if (linkMatch) {
-        const inviteCode = linkMatch[1];
-        statusText = statusText.replace(linkMatch[0], '').trim();
+    if (!quotedMessage) {
+        if (!caption) return;
         try {
-            // Link se group JID nikalo
-            const groupInfo = await sock.groupGetInviteInfo(inviteCode).catch(() => null);
-            if (groupInfo && groupInfo.id) {
-                targetGroupJid = groupInfo.id;
-            } else {
-                // Agar bot pehle se us group me nahi to join karne ki koshish
-                const joinedId = await sock.groupAcceptInvite(inviteCode).catch(() => null);
-                if (joinedId) targetGroupJid = joinedId;
-            }
-        } catch {}
-    } else if (jidMatch) {
-        targetGroupJid = jidMatch[1];
-        statusText = statusText.replace(jidMatch[0], '').trim();
+            await postGroupStatus(sock, chatId, { text: caption, backgroundColor: PURPLE_COLOR });
+            await sock.sendMessage(chatId, { react: { text: "✅", key: message.key } });
+        } catch (e) {
+            await sock.sendMessage(chatId, { react: { text: "❌", key: message.key } });
+        }
+        return;
     }
 
-    // Quoted media
-    let targetMessage = null;
-    let rawQuotedContent = null;
-    if (quotedMessage) {
-        rawQuotedContent = quotedMessage.ephemeralMessage?.message || quotedMessage.viewOnceMessageV2?.message || quotedMessage;
-        targetMessage = { key: { remoteJid: targetGroupJid, id: stanzaId, participant }, message: quotedMessage };
-    }
-
-    const contentToCheck = rawQuotedContent || m.message || {};
-    const innerContent = contentToCheck.ephemeralMessage?.message || contentToCheck.viewOnceMessageV2?.message || contentToCheck.viewOnceMessage?.message || contentToCheck;
-
-    const isQuotedImage =!!innerContent.imageMessage;
-    const isQuotedVideo =!!innerContent.videoMessage;
-    const isQuotedAudio =!!(innerContent.audioMessage || innerContent.pttMessage);
-    const hasQuotedMedia = isQuotedImage || isQuotedVideo || isQuotedAudio;
-
-    const isDirectImage =!!m.message?.imageMessage;
-    const isDirectVideo =!!m.message?.videoMessage;
-    const hasDirectMedia = isDirectImage || isDirectVideo;
-
-    let hasMedia = hasQuotedMedia || hasDirectMedia;
-    let finalContent = innerContent;
-    let downloadTarget = hasQuotedMedia? targetMessage : m;
-
-    if (hasDirectMedia) {
-        finalContent = m.message.viewOnceMessageV2?.message || m.message.ephemeralMessage?.message || m.message;
-        downloadTarget = m;
-        hasMedia = true;
-    }
-
-    // Agar na text hai na media -> Example wala message bhejo (dusre bot jaisa)
-    if (!statusText &&!hasMedia) {
-        return reply(
-            `⚠️ PROVIDE TEXT OR REPLY TO MEDIA!\n\n` +
-            `EXAMPLES:\n` +
-            `•.GCSTATUS HELLO (STATUS IN THIS GROUP)\n` +
-            `•.GCSTATUS https://chat.whatsapp.com/xxxx HELLO (STATUS IN THAT GROUP VIA LINK)\n` +
-            `•.GCSTATUS 12345678@g.us HELLO (STATUS IN THAT GROUP VIA JID)\n` +
-            `• REPLY TO IMAGE/VIDEO WITH.GCSTATUS (MEDIA STATUS, SAME TARGETING RULES)`
-        );
-    }
-
-    await sock.sendMessage(from, { react: { text: '⏳', key: m.key } });
+    const mediaPayload = unwrapQuotedMessage(quotedMessage);
+    const mediaType = detectMediaType(mediaPayload);
+    if (!mediaType) return;
 
     try {
-        if (hasMedia) {
-            const mediaBuffer = await downloadMediaMessage(downloadTarget, 'buffer', {}, { logger: pino({ level: 'silent' }), reuploadRequest: sock.updateMediaMessage });
-            const textParts = splitTextPreservingFormat(statusText, WHATSAPP_STATUS_TEXT_LIMIT);
-            const captions = textParts.length? textParts : [statusText || undefined];
+        const buffer = await downloadMedia(mediaPayload, mediaType);
+        if (!buffer?.length) throw new Error("Download failed");
 
-            for (const caption of captions) {
-                let mediaOptions = {};
-                if (finalContent.imageMessage) mediaOptions = { image: mediaBuffer, caption };
-                else if (finalContent.videoMessage) mediaOptions = { video: mediaBuffer, caption };
-                else mediaOptions = { audio: mediaBuffer, mimetype: finalContent.audioMessage?.mimetype || 'audio/mp4' };
-
-                const preparedMedia = await prepareWAMessageMedia(mediaOptions, { upload: sock.wsUploadToServer });
-                let finalMediaMessage = {};
-                if (finalContent.imageMessage) finalMediaMessage = { imageMessage: preparedMedia.imageMessage };
-                else if (finalContent.videoMessage) finalMediaMessage = { videoMessage: preparedMedia.videoMessage };
-                else finalMediaMessage = { audioMessage: preparedMedia.audioMessage };
-
-                await relayGroupStatus(sock, targetGroupJid, { groupStatusMessageV2: { message: finalMediaMessage } });
-            }
+        if (mediaType === "audio") {
+            const voiceNote = await convertToVoiceNote(buffer);
+            const waveform = await generateWaveform(buffer).catch(() => undefined);
+            await postGroupStatus(sock, chatId, { audio: voiceNote, mimetype: "audio/ogg; codecs=opus", ptt: true, waveform });
+        } else if (mediaType === "sticker") {
+            await postGroupStatus(sock, chatId, { sticker: buffer });
         } else {
-            const parts = splitTextPreservingFormat(statusText, WHATSAPP_STATUS_TEXT_LIMIT);
-            for (const part of parts) {
-                const randomHex = Math.floor(Math.random() * 0xFFFFFF).toString(16).padStart(6, '0');
-                await relayGroupStatus(sock, targetGroupJid, {
-                    groupStatusMessageV2: {
-                        message: {
-                            extendedTextMessage: {
-                                text: part,
-                                backgroundArgb: 0xFF000000 + parseInt(randomHex, 16),
-                                font: 2
-                            }
-                        }
-                    }
-                });
-            }
+            await postGroupStatus(sock, chatId, { [mediaType]: buffer, caption: caption || '' });
         }
-
-        await sock.sendMessage(from, { react: { text: '✅', key: m.key } });
-        // Dusre bot jaisa success message
-        return reply(`🎉 STATUS SENT TO:\n${targetGroupJid}`);
+        await sock.sendMessage(chatId, { react: { text: "✅", key: message.key } });
     } catch (error) {
-        console.error('[GCSTATUS] error:', error);
-        await sock.sendMessage(from, { react: { text: '❌', key: m.key } });
-        return reply(`❌ Failed to post group status.\n${error.message}`);
+        console.error(error);
+        await sock.sendMessage(chatId, { react: { text: "❌", key: message.key } });
     }
 }
 
