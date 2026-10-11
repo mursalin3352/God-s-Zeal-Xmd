@@ -9,21 +9,16 @@ const WHATSAPP_STATUS_TEXT_LIMIT = 1024;
 
 function splitTextPreservingFormat(input, limit = WHATSAPP_STATUS_TEXT_LIMIT) {
     if (!input) return [];
-
     const chunks = [];
     let remaining = input;
-
     while (remaining.length > limit) {
         let splitAt = remaining.lastIndexOf('\n', limit);
         if (splitAt <= 0) splitAt = remaining.lastIndexOf(' ', limit);
         if (splitAt <= 0) splitAt = limit;
-
         chunks.push(remaining.slice(0, splitAt));
         remaining = remaining.slice(splitAt);
     }
-
     if (remaining.length) chunks.push(remaining);
-
     return chunks;
 }
 
@@ -43,7 +38,6 @@ async function relayGroupStatus(sock, from, payload) {
         payload,
         { userJid: sock.user.id }
     );
-
     await sock.relayMessage(from, generatedMessage.message, {
         messageId: generatedMessage.key.id
     });
@@ -58,9 +52,13 @@ async function gcstatus(sock, chatId, message, inputText) {
         return reply('❌ This command is for groups only.');
     }
 
-    const quotedInfo = m.message?.extendedTextMessage?.contextInfo;
+    // FIX: quoted ko sahi se pakadna + command text ko clean karna
+    const quotedInfo = m.message?.extendedTextMessage?.contextInfo || m.message?.imageMessage?.contextInfo || m.message?.videoMessage?.contextInfo || {};
     const quotedMessage = quotedInfo?.quotedMessage || null;
-    const text = Array.isArray(inputText)? inputText.join(' ') : String(inputText || '');
+
+    let rawText = Array.isArray(inputText)? inputText.join(' ') : String(inputText || '');
+    rawText = rawText.replace(/^\.?gcstatus\s*/i, '').trim();
+    const text = rawText;
 
     const targetMessage = quotedMessage
       ? {
@@ -73,12 +71,22 @@ async function gcstatus(sock, chatId, message, inputText) {
         }
         : m;
 
-    const content = targetMessage.message || {};
+    const rawContent = targetMessage.message || {};
+    const content = rawContent.ephemeralMessage?.message || rawContent.viewOnceMessageV2?.message || rawContent;
+
     const isImage =!!content.imageMessage;
     const isVideo =!!content.videoMessage;
-    const isAudio =!!content.audioMessage;
-    const fallbackText = extractTextFromMessage(content);
-    const statusText = text || fallbackText;
+    const isAudio =!!content.audioMessage ||!!content.pttMessage;
+
+    let fallbackText = '';
+    if (isImage) fallbackText = content.imageMessage?.caption || '';
+    else if (isVideo) fallbackText = content.videoMessage?.caption || '';
+    else fallbackText = extractTextFromMessage(content);
+
+    let statusText = text || fallbackText;
+    if (statusText.trim().toLowerCase() === '.gcstatus' || statusText.trim().toLowerCase() === 'gcstatus') {
+        statusText = '';
+    }
 
     if (!isImage &&!isVideo &&!isAudio &&!statusText) {
         return reply(
@@ -105,7 +113,7 @@ async function gcstatus(sock, chatId, message, inputText) {
                 }
             );
 
-            const captions = textParts.length? textParts : [undefined];
+            const captions = textParts.length? textParts : [statusText || undefined];
 
             for (const caption of captions) {
                 let mediaOptions = {};
